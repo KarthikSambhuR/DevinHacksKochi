@@ -1,0 +1,660 @@
+package main
+
+import (
+	"database/sql"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+var dbPath = "localflow.db"
+
+var db *sql.DB
+
+// initDB opens the SQLite database, creates the recordings and analytics tables, and performs migrations.
+func initDB() error {
+	cfg := loadConfig()
+	dataDir := getBaseAppDir()
+	if cfg.DataFolder != "" && cfg.DataFolder != "Default" {
+		dataDir = cfg.DataFolder
+	}
+
+	// 1. Migrate legacy database file if present in current directory but not in new dataDir
+	legacyDb := "localflow.db"
+	newDb := filepath.Join(dataDir, "localflow.db")
+	if dataDir != "." {
+		if _, err := os.Stat(newDb); err != nil {
+			if _, errLegacy := os.Stat(legacyDb); errLegacy == nil {
+				dbData, errRead := os.ReadFile(legacyDb)
+				if errRead == nil {
+					_ = os.MkdirAll(dataDir, 0755)
+					if errWrite := os.WriteFile(newDb, dbData, 0644); errWrite == nil {
+						_ = os.Remove(legacyDb)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Migrate legacy audio_cache if present in current directory but not in dataDir
+	legacyAudio := "audio_cache"
+	newAudio := filepath.Join(dataDir, "audio_cache")
+	if dataDir != "." {
+		if _, err := os.Stat(newAudio); err != nil {
+			if _, errLegacy := os.Stat(legacyAudio); errLegacy == nil {
+				_ = os.MkdirAll(newAudio, 0755)
+				entries, errRead := os.ReadDir(legacyAudio)
+				if errRead == nil {
+					for _, entry := range entries {
+						if !entry.IsDir() {
+							oldF := filepath.Join(legacyAudio, entry.Name())
+							newF := filepath.Join(newAudio, entry.Name())
+							if data, errF := os.ReadFile(oldF); errF == nil {
+								if errW := os.WriteFile(newF, data, 0644); errW == nil {
+									_ = os.Remove(oldF)
+								}
+							}
+						}
+					}
+					_ = os.Remove(legacyAudio)
+				}
+			}
+		}
+	}
+
+	// 3. Migrate legacy models folder if present in current directory but not in dataDir
+	legacyModels := "models"
+	newModels := filepath.Join(dataDir, "models")
+	if dataDir != "." {
+		if _, err := os.Stat(newModels); err != nil {
+			if _, errLegacy := os.Stat(legacyModels); errLegacy == nil {
+				_ = os.MkdirAll(newModels, 0755)
+				entries, errRead := os.ReadDir(legacyModels)
+				if errRead == nil {
+					for _, entry := range entries {
+						if !entry.IsDir() && filepath.Ext(entry.Name()) == ".bin" {
+							oldF := filepath.Join(legacyModels, entry.Name())
+							newF := filepath.Join(newModels, entry.Name())
+							if data, errF := os.ReadFile(oldF); errF == nil {
+								if errW := os.WriteFile(newF, data, 0644); errW == nil {
+									_ = os.Remove(oldF)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	dbPath = filepath.Join(dataDir, "localflow.db")
+	audioCacheDir = filepath.Join(dataDir, "audio_cache")
+
+	_ = os.MkdirAll(dataDir, 0755)
+
+	var err error
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS recordings (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			filename      TEXT    NOT NULL,
+			timestamp     DATETIME NOT NULL,
+			transcription TEXT,
+			transcription_time_us INTEGER DEFAULT 0,
+			duration_ms   INTEGER DEFAULT 0
+		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Schema migration: add columns if they do not exist
+	_, _ = db.Exec(`ALTER TABLE recordings ADD COLUMN word_count INTEGER DEFAULT 0;`)
+	_, _ = db.Exec(`ALTER TABLE recordings ADD COLUMN transcription_time_us INTEGER DEFAULT 0;`)
+	_, _ = db.Exec(`ALTER TABLE recordings ADD COLUMN raw_transcription TEXT;`)
+	_, _ = db.Exec(`ALTER TABLE recordings ADD COLUMN duration_ms INTEGER DEFAULT 0;`)
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS analytics (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp     DATETIME NOT NULL,
+			duration_ms   INTEGER DEFAULT 0,
+			word_count    INTEGER DEFAULT 0
+		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS profile (
+			key   TEXT PRIMARY KEY,
+			value TEXT
+		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS dictionary (
+			id   INTEGER PRIMARY KEY AUTOINCREMENT,
+			word TEXT UNIQUE NOT NULL
+		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS transliterations (
+			id        INTEGER PRIMARY KEY AUTOINCREMENT,
+			malayalam TEXT UNIQUE NOT NULL,
+			translit  TEXT NOT NULL
+		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS meetings (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			duration_seconds INTEGER DEFAULT 0,
+			audio_path TEXT,
+			summary_markdown TEXT,
+			short_summary TEXT,
+			full_transcript TEXT
+		);
+	`)
+	if err != nil {
+		return err
+	}
+	// Migrate: add short_summary column if it doesn't exist yet
+	_, _ = db.Exec(`ALTER TABLE meetings ADD COLUMN short_summary TEXT`)
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS meeting_segments (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			meeting_id TEXT NOT NULL,
+			speaker TEXT NOT NULL,
+			start_ms INTEGER DEFAULT 0,
+			end_ms INTEGER DEFAULT 0,
+			text TEXT NOT NULL,
+			language TEXT DEFAULT 'en',
+			FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+		);
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Perform background migration for legacy records that have empty/0 word_count but non-empty transcription
+	go migrateLegacyWordCounts()
+
+	return nil
+}
+
+func migrateLegacyWordCounts() {
+	if db == nil {
+		return
+	}
+	rows, err := db.Query(`SELECT id, transcription FROM recordings WHERE (word_count = 0 OR word_count IS NULL) AND transcription IS NOT NULL AND transcription != ''`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	type legacyRec struct {
+		id   int
+		text string
+	}
+	var legacy []legacyRec
+	for rows.Next() {
+		var r legacyRec
+		if err := rows.Scan(&r.id, &r.text); err == nil {
+			legacy = append(legacy, r)
+		}
+	}
+
+	if len(legacy) > 0 {
+		tx, err := db.Begin()
+		if err == nil {
+			stmt, err := tx.Prepare(`UPDATE recordings SET word_count = ? WHERE id = ?`)
+			if err == nil {
+				for _, r := range legacy {
+					wc := len(strings.Fields(r.text))
+					_, _ = stmt.Exec(wc, r.id)
+				}
+				_ = tx.Commit()
+			} else {
+				tx.Rollback()
+			}
+		}
+	}
+
+	// Populate analytics if empty
+	var count int
+	_ = db.QueryRow("SELECT COUNT(*) FROM analytics").Scan(&count)
+	if count == 0 {
+		_, _ = db.Exec("INSERT INTO analytics (timestamp, duration_ms, word_count) SELECT timestamp, duration_ms, word_count FROM recordings")
+	}
+}
+
+// saveRecording inserts a completed recording into the database.
+// rawTranscription is the unmodified Whisper output; transcription is the final (possibly LLM-refined) text.
+func saveRecording(filename string, timestamp time.Time, durationMs int64, rawTranscription string, transcription string, transcriptionTimeUs int64) {
+	if db == nil {
+		return
+	}
+	wc := len(strings.Fields(transcription))
+	tsStr := timestamp.UTC().Format(time.RFC3339)
+	db.Exec(
+		`INSERT INTO recordings (filename, timestamp, duration_ms, transcription, raw_transcription, word_count, transcription_time_us) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		filename, tsStr, durationMs, transcription, rawTranscription, wc, transcriptionTimeUs,
+	)
+	db.Exec(
+		`INSERT INTO analytics (timestamp, duration_ms, word_count) VALUES (?, ?, ?)`,
+		tsStr, durationMs, wc,
+	)
+}
+
+// Recording represents a single transcript entry
+type Recording struct {
+	ID                int    `json:"id"`
+	Filename          string `json:"filename"`
+	Timestamp         string `json:"timestamp"`
+	DurationMs        int64  `json:"duration_ms"`
+	Transcription     string `json:"transcription"`
+	RawTranscription  string `json:"raw_transcription"`
+	WordCount         int    `json:"word_count"`
+	TranscriptionTime int64  `json:"transcription_time_us"`
+}
+
+// GetRecordings fetches all recordings from the database, sorted by latest first.
+func GetRecordings() ([]Recording, error) {
+	if db == nil {
+		return nil, nil
+	}
+	rows, err := db.Query(`SELECT id, filename, timestamp, duration_ms, transcription, COALESCE(raw_transcription, '') as raw_transcription, word_count, transcription_time_us FROM recordings ORDER BY timestamp DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Recording
+	for rows.Next() {
+		var r Recording
+		if err := rows.Scan(&r.ID, &r.Filename, &r.Timestamp, &r.DurationMs, &r.Transcription, &r.RawTranscription, &r.WordCount, &r.TranscriptionTime); err != nil {
+			continue
+		}
+		// If word count is 0 but we have transcription text, calculate it on the fly
+		if r.WordCount == 0 && r.Transcription != "" {
+			r.WordCount = len(strings.Fields(r.Transcription))
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// Analytics represents stats metadata saved permanently
+type Analytics struct {
+	Timestamp  string `json:"timestamp"`
+	DurationMs int64  `json:"duration_ms"`
+	WordCount  int    `json:"word_count"`
+}
+
+// GetAnalytics fetches all historical analytics entries
+func GetAnalytics() ([]Analytics, error) {
+	if db == nil {
+		return nil, nil
+	}
+	rows, err := db.Query(`SELECT timestamp, duration_ms, word_count FROM analytics ORDER BY timestamp DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Analytics
+	for rows.Next() {
+		var a Analytics
+		if err := rows.Scan(&a.Timestamp, &a.DurationMs, &a.WordCount); err != nil {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// pruneRecordings completely deletes recordings and their physical WAV audio files older than retentionDays.
+func pruneRecordings(retentionDays int) {
+	if db == nil || retentionDays <= 0 {
+		return
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format(time.RFC3339)
+
+	// 1. Get physical audio filenames to delete
+	rows, err := db.Query(`SELECT filename FROM recordings WHERE timestamp < ? AND filename != ''`, cutoff)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var filename string
+			if err := rows.Scan(&filename); err == nil && filename != "" {
+				path := filepath.Join(audioCacheDir, filename)
+				os.Remove(path)
+			}
+		}
+	}
+
+	// 2. Completely delete recording entries
+	_, _ = db.Exec(`DELETE FROM recordings WHERE timestamp < ?`, cutoff)
+}
+
+// DeleteRecording deletes a single recording and its associated audio file and analytics entry.
+func DeleteRecording(id int) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	var filename string
+	var timestamp string
+	err := db.QueryRow(`SELECT filename, timestamp FROM recordings WHERE id = ?`, id).Scan(&filename, &timestamp)
+	if err != nil {
+		return err
+	}
+	if filename != "" {
+		path := filepath.Join(audioCacheDir, filename)
+		_ = os.Remove(path)
+	}
+	_, _ = db.Exec(`DELETE FROM analytics WHERE timestamp = ?`, timestamp)
+	_, err = db.Exec(`DELETE FROM recordings WHERE id = ?`, id)
+	return err
+}
+
+// UpdateRecording updates the transcription text and word count for a recording and its analytics entry.
+func UpdateRecording(id int, newText string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	var timestamp string
+	err := db.QueryRow(`SELECT timestamp FROM recordings WHERE id = ?`, id).Scan(&timestamp)
+	if err != nil {
+		return err
+	}
+	wc := len(strings.Fields(newText))
+	_, _ = db.Exec(`UPDATE analytics SET word_count = ? WHERE timestamp = ?`, wc, timestamp)
+	_, err = db.Exec(`UPDATE recordings SET transcription = ?, word_count = ? WHERE id = ?`, newText, wc, id)
+	return err
+}
+
+// closeDB closes the database connection.
+func closeDB() {
+
+	if db != nil {
+		db.Close()
+	}
+}
+
+func GetProfileValue(key string) string {
+	if db == nil {
+		return ""
+	}
+	var val string
+	err := db.QueryRow("SELECT value FROM profile WHERE key = ?", key).Scan(&val)
+	if err != nil {
+		return ""
+	}
+	return val
+}
+
+func SetProfileValue(key string, val string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	_, err := db.Exec("INSERT INTO profile (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, val)
+	return err
+}
+
+func AddDictionaryWord(word string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	word = strings.TrimSpace(word)
+	if word == "" {
+		return nil
+	}
+	_, err := db.Exec("INSERT INTO dictionary (word) VALUES (?) ON CONFLICT(word) DO NOTHING", word)
+	return err
+}
+
+func DeleteDictionaryWord(word string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	_, err := db.Exec("DELETE FROM dictionary WHERE word = ?", word)
+	return err
+}
+
+func GetDictionaryWords() ([]string, error) {
+	if db == nil {
+		return nil, nil
+	}
+	rows, err := db.Query("SELECT word FROM dictionary ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var w string
+		if err := rows.Scan(&w); err == nil {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
+type WordMapping struct {
+	Malayalam string `json:"malayalam"`
+	Translit  string `json:"translit"`
+}
+
+func AddTransliteration(malayalam, translit string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	malayalam = strings.ToLower(strings.TrimSpace(malayalam))
+	translit = strings.TrimSpace(translit)
+	if malayalam == "" || translit == "" {
+		return nil
+	}
+	_, err := db.Exec("INSERT INTO transliterations (malayalam, translit) VALUES (?, ?) ON CONFLICT(malayalam) DO UPDATE SET translit = excluded.translit", malayalam, translit)
+	return err
+}
+
+func DeleteTransliteration(malayalam string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	malayalam = strings.ToLower(strings.TrimSpace(malayalam))
+	_, err := db.Exec("DELETE FROM transliterations WHERE malayalam = ?", malayalam)
+	return err
+}
+
+func GetTransliterations() ([]WordMapping, error) {
+	if db == nil {
+		return nil, nil
+	}
+	rows, err := db.Query("SELECT malayalam, translit FROM transliterations ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []WordMapping
+	for rows.Next() {
+		var m WordMapping
+		if err := rows.Scan(&m.Malayalam, &m.Translit); err == nil {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+type Meeting struct {
+	ID              string `json:"id"`
+	Title           string `json:"title"`
+	CreatedAt       string `json:"created_at"`
+	DurationSeconds int    `json:"duration_seconds"`
+	AudioPath       string `json:"audio_path"`
+	SummaryMarkdown string `json:"summary_markdown"`
+	ShortSummary    string `json:"short_summary"`
+	FullTranscript  string `json:"full_transcript"`
+}
+
+type MeetingSegment struct {
+	ID        int    `json:"id"`
+	MeetingID string `json:"meeting_id"`
+	Speaker   string `json:"speaker"`
+	StartMs   int64  `json:"start_ms"`
+	EndMs     int64  `json:"end_ms"`
+	Text      string `json:"text"`
+	Language  string `json:"language"`
+}
+
+type MeetingDetail struct {
+	Meeting  Meeting          `json:"meeting"`
+	Segments []MeetingSegment `json:"segments"`
+}
+
+func InsertMeeting(m Meeting) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	_, err := db.Exec(`
+		INSERT INTO meetings (id, title, created_at, duration_seconds, audio_path, summary_markdown, full_transcript)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, m.ID, m.Title, m.CreatedAt, m.DurationSeconds, m.AudioPath, m.SummaryMarkdown, m.FullTranscript)
+	return err
+}
+
+func UpdateMeetingSummary(id string, summary string, shortSummary string, fullTranscript string, durationSeconds int) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	_, err := db.Exec(`
+		UPDATE meetings 
+		SET summary_markdown = ?, short_summary = ?, full_transcript = ?, duration_seconds = ?
+		WHERE id = ?
+	`, summary, shortSummary, fullTranscript, durationSeconds, id)
+	return err
+}
+
+func InsertMeetingSegment(s MeetingSegment) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	_, err := db.Exec(`
+		INSERT INTO meeting_segments (meeting_id, speaker, start_ms, end_ms, text, language)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, s.MeetingID, s.Speaker, s.StartMs, s.EndMs, s.Text, s.Language)
+	return err
+}
+
+func GetMeetings() ([]Meeting, error) {
+	if db == nil {
+		return nil, nil
+	}
+	rows, err := db.Query(`
+		SELECT id, title, created_at, duration_seconds, audio_path, summary_markdown, short_summary, full_transcript
+		FROM meetings
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var meetings []Meeting
+	for rows.Next() {
+		var m Meeting
+		var dt time.Time
+		if err := rows.Scan(&m.ID, &m.Title, &dt, &m.DurationSeconds, &m.AudioPath, &m.SummaryMarkdown, &m.ShortSummary, &m.FullTranscript); err == nil {
+			m.CreatedAt = dt.Format(time.RFC3339)
+			meetings = append(meetings, m)
+		} else {
+			// Try scan as string if sqlite stored as text
+			var dtStr string
+			if err2 := rows.Scan(&m.ID, &m.Title, &dtStr, &m.DurationSeconds, &m.AudioPath, &m.SummaryMarkdown, &m.ShortSummary, &m.FullTranscript); err2 == nil {
+				m.CreatedAt = dtStr
+				meetings = append(meetings, m)
+			}
+		}
+	}
+	return meetings, nil
+}
+
+func GetMeetingDetail(id string) (*MeetingDetail, error) {
+	if db == nil {
+		return nil, sql.ErrConnDone
+	}
+	var m Meeting
+	var dt time.Time
+	err := db.QueryRow(`
+		SELECT id, title, created_at, duration_seconds, audio_path, summary_markdown, short_summary, full_transcript
+		FROM meetings WHERE id = ?
+	`, id).Scan(&m.ID, &m.Title, &dt, &m.DurationSeconds, &m.AudioPath, &m.SummaryMarkdown, &m.ShortSummary, &m.FullTranscript)
+	if err == nil {
+		m.CreatedAt = dt.Format(time.RFC3339)
+	} else {
+		var dtStr string
+		err2 := db.QueryRow(`
+			SELECT id, title, created_at, duration_seconds, audio_path, summary_markdown, short_summary, full_transcript
+			FROM meetings WHERE id = ?
+		`, id).Scan(&m.ID, &m.Title, &dtStr, &m.DurationSeconds, &m.AudioPath, &m.SummaryMarkdown, &m.ShortSummary, &m.FullTranscript)
+		if err2 != nil {
+			return nil, err2
+		}
+		m.CreatedAt = dtStr
+	}
+
+	rows, err := db.Query(`
+		SELECT id, meeting_id, speaker, start_ms, end_ms, text, language
+		FROM meeting_segments
+		WHERE meeting_id = ?
+		ORDER BY start_ms ASC
+	`, id)
+	if err != nil {
+		return &MeetingDetail{Meeting: m}, nil
+	}
+	defer rows.Close()
+
+	var segs []MeetingSegment
+	for rows.Next() {
+		var s MeetingSegment
+		if err := rows.Scan(&s.ID, &s.MeetingID, &s.Speaker, &s.StartMs, &s.EndMs, &s.Text, &s.Language); err == nil {
+			segs = append(segs, s)
+		}
+	}
+	return &MeetingDetail{Meeting: m, Segments: segs}, nil
+}
+
+func DeleteMeeting(id string) error {
+	if db == nil {
+		return sql.ErrConnDone
+	}
+	_, _ = db.Exec("DELETE FROM meeting_segments WHERE meeting_id = ?", id)
+	_, err := db.Exec("DELETE FROM meetings WHERE id = ?", id)
+	return err
+}
+
+

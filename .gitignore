@@ -1,4 +1,4 @@
-# Local secrets; sanitized example files may be committed.
+# Local secrets and credentials
 .env
 .env.*
 !.env.example
@@ -6,11 +6,12 @@
 *.pem
 *.key
 
-# Common dependencies, build output, caches, and local tooling.
+# Dependencies, caches, and generated output
 node_modules/
+frontend/node_modules/
 .next/
+frontend/dist/
 dist/
-build/
 coverage/
 .venv/
 venv/
@@ -21,4 +22,18 @@ __pycache__/
 Thumbs.db
 *.log
 
-# Add entries appropriate to your chosen language or framework.
+# LocalFlow downloads, data, and build output
+build/bin/
+build/New Folder/
+fonts/
+models/
+audio_cache/
+localflow.db
+localflow_config.json
+dll_builder/
+run_dev.bat
+LocalFlow.exe
+installer/build/
+payload.zip
+temp_payload/
+LocalFlow-res.syso

@@ -1,5 +1,12 @@
 # Change log
 
+## 2026-10-25T00:10:21+05:30 — Bring LocalFlow into the Devin Hack Kochi repository
+
+- Changed: merged the existing template repository history with LocalFlow's original Git history; adapted this README and combined template and project ignore rules.
+- Why: use the event template as the project repository while retaining both histories and the existing template guidance.
+- Validation: retained the template and LocalFlow histories and source tree. `git diff --cached --check` reported existing whitespace in imported source files; application checks are pending.
+- Limitations: the source working-tree updates are to be recorded in a follow-up commit; team and demo details remain TODO; application checks are pending.
+
 ## 2026-10-24T21:53:05+05:30 — Correct Devin Hack Kochi event guidance
 
 - Changed: corrected the current event name and AI tool guidance in `.github/pull_request_template.md`, `AGENTS.md`, `AI_USAGE.md`, `CHANGELOG.md`, `README.md`, `RULES.md`, `SUBMISSION.md`.

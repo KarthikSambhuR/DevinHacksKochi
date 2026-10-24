@@ -4,11 +4,11 @@ If maintaining this record, briefly document the actual contributions of whichev
 
 ## Event build log
 
-No participant AI usage has been recorded yet. Replace the placeholder row as you build. Mark human review as pending until someone has reviewed the contribution.
+This log records actual AI assistance on the project; human review remains pending until a participant reviews each contribution.
 
 | Date and time with timezone | Tool / model, if known | Task | Assistance and affected files | Human review / corrections | Validation and result |
 | --- | --- | --- | --- | --- | --- |
-| TODO | Tool / model used, if any | TODO | TODO | Pending | TODO |
+| 2026-10-25T00:10:21+05:30 | OpenAI Codex (GPT-6) | Integrate the LocalFlow repository with the Devin Hack Kochi template | Inspected both histories, merged them, and adapted `.gitignore`, `README.md`, `CHANGELOG.md`, and `SUBMISSION.md` | Pending | Histories and template instructions reviewed; `git diff --cached --check` reported existing source whitespace; application checks pending |
 
 ## Template preparation
 

@@ -1,47 +1,75 @@
-# Devin Hack Kochi
+# LocalFlow
 
-A repository template for participants at Devin Hack Kochi. It contains event guidance and documentation scaffolding; follow the organizers' current project-start instructions.
+LocalFlow is a Windows desktop dictation and meeting transcription app. It captures speech locally, transcribes it with selectable speech models, and can refine text before inserting it into the active application. The project also includes a browser companion extension for meeting speaker information.
 
-**[Event rules](RULES.md)** · **[Agent instructions](AGENTS.md)**
+**Devin Hack Kochi code repository:** [KarthikSambhuR/DevinHacksKochi](https://github.com/KarthikSambhuR/DevinHacksKochi)
 
-## Event details
+## Project overview
 
-Devin Hack Kochi has no major AI usage constraints. Participants may use Devin and other AI tools, models, and providers; this template does not require Codex or restrict AI usage to OpenAI. AI usage notes are project documentation, not an additional event eligibility requirement.
+- **Project name:** LocalFlow
+- **Short description:** Offline-first Windows dictation and meeting transcription with local speech and text models.
+- **Team:** TODO — add participant names and GitHub handles.
+- **Working demo:** TODO — add a demo link or local walkthrough.
+- **Technology stack:** Go, Wails, JavaScript, Whisper.cpp, ONNX Runtime, SQLite, and a Manifest V3 browser extension.
 
-The organizer shared an older event template. Follow the current organizer announcements for logistics, participation format, eligibility, submission timing, and credits; the older template's details do not apply. See [RULES.md](RULES.md).
+## Features
 
-## Use this template
+- Global hotkey dictation with a compact overlay and local transcription.
+- Optional text refinement and vocabulary personalization.
+- Meeting transcription and summaries using locally configured models.
+- Browser companion extension support for meeting speaker names.
+- Local transcript storage and cleanup controls.
 
-1. Select **Use this template → Create a new repository** on GitHub. Create your own project repository and clone it.
-2. Read [RULES.md](RULES.md) and [AGENTS.md](AGENTS.md) before building. Follow the organizers' current project-start instructions.
-3. Fill in the project overview below as you build. Use any suitable language or framework, keeping the implementation simple.
-4. Record meaningful changes in [CHANGELOG.md](CHANGELOG.md) and, if maintained, your actual AI assistance in [AI_USAGE.md](AI_USAGE.md). Commit after completed milestones; aim for a meaningful checkpoint about every 30 minutes.
-5. Complete [SUBMISSION.md](SUBMISSION.md) with your code repository, short project description, and working demo. Follow submission instructions announced by the organizers.
+Model availability and performance depend on the model files and hardware configured on the user's machine. The browser companion requires manual installation in a supported browser.
 
-This template has no application code or required technology stack. The documentation and commit cadence are repository workflow guidance; the event participation rules are in [RULES.md](RULES.md).
+## Run from source
 
-## Project overview — complete during the event
+### Prerequisites
 
-- **Project name:** TODO
-- **Short description:** TODO — what it does, who it helps, and why it matters.
-- **Team:** TODO — participant names and GitHub handles.
-- **Working demo:** TODO — link or local demo instructions.
-- **Technology stack:** TODO
+- Windows 10 or later.
+- Go 1.25 or later, as specified in `go.mod`.
+- Node.js and npm for the Wails frontend.
+- Wails v2 CLI (the module uses v2.10.2).
+- A C compiler and CGO-enabled Go toolchain for native dependencies.
 
-### Run the project
+### Setup and development
 
-Replace these placeholders with commands that actually work for your project:
+```powershell
+git clone https://github.com/KarthikSambhuR/DevinHacksKochi.git
+cd DevinHacksKochi
+cd frontend
+npm ci
+cd ..
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
+wails dev
+```
 
-1. Prerequisites and versions: TODO
-2. Dependency installation: TODO
-3. Environment setup: TODO — list required variable names and provide a sanitized `.env.example` if needed.
-4. Start the project: TODO
-5. Run checks or tests: TODO
+The application may need model files downloaded through its model settings before transcription features are available. Do not commit private model files, API keys, or local transcript data.
 
-### Current status
+### Checks
 
-- Working features: TODO
-- Known limitations: TODO
-- Libraries, APIs, and public datasets used: TODO — include source links and applicable attribution.
+```powershell
+go test ./...
+node --test extension/bridge.test.cjs
+cd frontend
+npm run build
+```
 
-See [AI_USAGE.md](AI_USAGE.md) for AI assistance and [CHANGELOG.md](CHANGELOG.md) for the development record.
+Run checks from the repository root unless the command says otherwise. Record the actual result in `CHANGELOG.md` when making a change.
+
+## Libraries and data sources
+
+- [Wails](https://wails.io/) provides the Go desktop application shell and webview integration.
+- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) provides speech recognition components.
+- [ONNX Runtime](https://onnxruntime.ai/) runs supported local inference models.
+- [modernc SQLite](https://pkg.go.dev/modernc.org/sqlite) provides local database storage.
+- Other Go dependencies and versions are listed in `go.mod`; frontend dependencies are listed in `frontend/package.json` and its lockfile.
+- No public dataset is bundled with the project. Speech and text inference use locally configured model files.
+
+## Current status
+
+- Working features: dictation, transcript management, meeting transcription, model settings, and browser companion integration are implemented in the repository.
+- Known limitations: Windows is the supported desktop target; model downloads and browser companion setup are separate user steps. Add any additional known limitations after testing.
+- Validation results: see the latest project entry in `CHANGELOG.md`.
+
+Read [RULES.md](RULES.md) for event guidance, [AGENTS.md](AGENTS.md) for repository workflow, [AI_USAGE.md](AI_USAGE.md) for the actual AI assistance record, and [SUBMISSION.md](SUBMISSION.md) for submission details.

@@ -4,9 +4,9 @@ Complete this file during the hackathon and use it to prepare your submission th
 
 ## Project
 
-- **Project name:** TODO
-- **Short description:** TODO — describe the problem, what you built, and who benefits.
-- **Code repository URL:** TODO
+- **Project name:** LocalFlow
+- **Short description:** Offline-first Windows dictation and meeting transcription with local speech and text models.
+- **Code repository URL:** https://github.com/KarthikSambhuR/DevinHacksKochi
 - **Final submitted implementation commit SHA:** TODO
 - **Working demo URL or local demo steps:** TODO
 - **Demo access requirements:** TODO — explain any prerequisites without including private credentials.

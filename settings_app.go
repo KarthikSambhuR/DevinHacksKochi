@@ -1,0 +1,1595 @@
+package main
+
+import (
+	"archive/zip"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/atotto/clipboard"
+	"github.com/gen2brain/malgo"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+// SettingsApp is a lightweight app struct for the settings window.
+type SettingsApp struct {
+	ctx          context.Context
+	InitialRoute string
+}
+
+var globalSettingsApp *SettingsApp
+var globalSettingsAppMutex sync.Mutex
+
+func GetGlobalSettingsApp() *SettingsApp {
+	globalSettingsAppMutex.Lock()
+	defer globalSettingsAppMutex.Unlock()
+	return globalSettingsApp
+}
+
+func NewSettingsApp(route string) *SettingsApp {
+	return &SettingsApp{InitialRoute: route}
+}
+
+func (s *SettingsApp) startup(ctx context.Context) {
+	s.ctx = ctx
+	globalSettingsAppMutex.Lock()
+	globalSettingsApp = s
+	globalSettingsAppMutex.Unlock()
+
+	initDB()
+	cfg := loadConfig()
+	pruneAudioCache(cfg.AudioRetentionDays)
+	pruneRecordings(cfg.TranscriptionRetentionDays)
+
+	// Set Wails context on meeting engine
+	GetMeetingEngine().SetContext(ctx)
+
+	// Ensure extension server is running
+	StartExtensionWebSocketServer()
+
+	// Restore the window to the size/state it was in when the user last closed it.
+	go func() {
+		// Give the WebView a moment to fully initialize before issuing window calls.
+		time.Sleep(150 * time.Millisecond)
+		if cfg.WindowMaximized {
+			wailsRuntime.WindowMaximise(s.ctx)
+		} else {
+			wailsRuntime.WindowSetSize(s.ctx, cfg.WindowWidth, cfg.WindowHeight)
+		}
+	}()
+}
+
+func (s *SettingsApp) SetRetention(audioDays int, transcriptionDays int) {
+	cfg := loadConfig()
+	cfg.AudioRetentionDays = audioDays
+	cfg.TranscriptionRetentionDays = transcriptionDays
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) PurgeNow() {
+	// 1. Delete all WAV files in the audio cache directory
+	entries, err := os.ReadDir(audioCacheDir)
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && filepath.Ext(entry.Name()) == ".wav" {
+				_ = os.Remove(filepath.Join(audioCacheDir, entry.Name()))
+			}
+		}
+	}
+	// 2. Clear all rows from recordings table
+	if db != nil {
+		_, _ = db.Exec("DELETE FROM recordings")
+	}
+}
+
+func (s *SettingsApp) GetMicrophones() []string {
+	mctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
+	if err != nil {
+		return []string{"Default"}
+	}
+	defer mctx.Free()
+	devices, err := mctx.Devices(malgo.Capture)
+	if err != nil {
+		return []string{"Default"}
+	}
+	out := []string{"Default"}
+	for _, info := range devices {
+		out = append(out, info.Name())
+	}
+	return out
+}
+
+func (s *SettingsApp) SetMicrophone(name string) {
+	cfg := loadConfig()
+	cfg.ActiveMicrophone = name
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) GetInitialRoute() string {
+	return s.InitialRoute
+}
+
+func (s *SettingsApp) GetRecordings() []Recording {
+	recs, _ := GetRecordings()
+	return recs
+}
+
+func (s *SettingsApp) DeleteRecording(id int) error {
+	return DeleteRecording(id)
+}
+
+func (s *SettingsApp) UpdateRecording(id int, newText string) error {
+	return UpdateRecording(id, newText)
+}
+
+func (s *SettingsApp) InstallUpdateAndRestart() error {
+	return triggerInstallUpdateAndRestart()
+}
+
+func (s *SettingsApp) GetVersion() string {
+	return AppVersion
+}
+
+func (s *SettingsApp) GetUpdateStatus() UpdateState {
+	return readUpdateState()
+}
+
+
+func (s *SettingsApp) GetAnalytics() []Analytics {
+	an, _ := GetAnalytics()
+	return an
+}
+
+func (s *SettingsApp) GetConfig() Config {
+	return loadConfig()
+}
+
+func (s *SettingsApp) SetInputBoost(enabled bool, gain float32) {
+	cfg := loadConfig()
+	cfg.InputBoostEnabled = enabled
+	cfg.InputBoostGain = gain
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetProcessingEngine(engine string) {
+	cfg := loadConfig()
+	if engine != "vulkan" && engine != "cuda" {
+		engine = "cpu"
+	}
+	cfg.ProcessingEngine = engine
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) GetGPUDevices() []string {
+	return GetGPUDevicesList()
+}
+
+func (s *SettingsApp) SetSelectedGPU(gpuName string) {
+	cfg := loadConfig()
+	cfg.SelectedGPU = gpuName
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetKeybinds(key1 uint16, name1 string, key2 uint16, name2 string) {
+	cfg := loadConfig()
+	cfg.Keybind1Rawcode = key1
+	cfg.Keybind1Name = name1
+	cfg.Keybind2Rawcode = key2
+	cfg.Keybind2Name = name2
+	cfg.KeybindCaptureActive = false
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetKeybindCaptureActive(active bool) {
+	cfg := loadConfig()
+	cfg.KeybindCaptureActive = active
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetStartOnStartup(enabled bool) error {
+	cfg := loadConfig()
+	if err := setAutoStart(enabled); err != nil {
+		return err
+	}
+	cfg.StartOnStartup = enabled
+	return saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetStartMinimized(enabled bool) error {
+	cfg := loadConfig()
+	cfg.StartMinimized = enabled
+	return saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetLLMEnableThinking(enabled bool) {
+	cfg := loadConfig()
+	cfg.LLMEnableThinking = enabled
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) GetPlatform() string {
+	return runtime.GOOS
+}
+
+func (s *SettingsApp) SelectDataFolder() (string, error) {
+	return wailsRuntime.OpenDirectoryDialog(s.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select LocalFlow Data Folder",
+	})
+}
+
+func (s *SettingsApp) SetDataFolder(path string) error {
+	cfg := loadConfig()
+	if cfg.DataFolder == path {
+		return nil
+	}
+
+	// Create the new folder if it doesn't exist
+	err := os.MkdirAll(path, 0755)
+	if err != nil {
+		return err
+	}
+
+	oldDataDir := getDataDir(cfg)
+
+	oldDbPath := filepath.Join(oldDataDir, "localflow.db")
+	newDbPath := filepath.Join(path, "localflow.db")
+
+	// 1. Close current database connection
+	closeDB()
+
+	// 2. Copy SQLite database file if it exists at old location
+	if _, err := os.Stat(oldDbPath); err == nil {
+		dbData, err := os.ReadFile(oldDbPath)
+		if err == nil {
+			_ = os.WriteFile(newDbPath, dbData, 0644)
+		}
+	}
+
+	// 3. Copy WAV files from old audio_cache to new audio_cache
+	oldAudioDir := filepath.Join(oldDataDir, "audio_cache")
+	newAudioDir := filepath.Join(path, "audio_cache")
+	_ = os.MkdirAll(newAudioDir, 0755)
+
+	entries, err := os.ReadDir(oldAudioDir)
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && filepath.Ext(entry.Name()) == ".wav" {
+				oldFile := filepath.Join(oldAudioDir, entry.Name())
+				newFile := filepath.Join(newAudioDir, entry.Name())
+				fileData, err := os.ReadFile(oldFile)
+				if err == nil {
+					_ = os.WriteFile(newFile, fileData, 0644)
+					_ = os.Remove(oldFile)
+				}
+			}
+		}
+	}
+
+	// 3.5. Move model files from the previous data folder and legacy project folder.
+	newModelsDir := filepath.Join(path, "models")
+	_ = os.MkdirAll(newModelsDir, 0755)
+	moveModelFiles(filepath.Join(oldDataDir, "models"), newModelsDir)
+	if oldDataDir != "." {
+		moveModelFiles("models", newModelsDir)
+	}
+
+	// Update config
+	cfg.DataFolder = path
+	saveConfig(cfg)
+
+	// 4. Re-open / initialize database at new path
+	return initDB()
+}
+
+func getDataDir(cfg Config) string {
+	if cfg.DataFolder != "" && cfg.DataFolder != "Default" {
+		return cfg.DataFolder
+	}
+	return getBaseAppDir()
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func copyFile(src string, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
+}
+
+func moveModelFiles(srcDir string, dstDir string) {
+	if srcDir == dstDir {
+		return
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".bin" {
+			continue
+		}
+		src := filepath.Join(srcDir, entry.Name())
+		dst := filepath.Join(dstDir, entry.Name())
+		if fileExists(dst) {
+			_ = os.Remove(src)
+			continue
+		}
+		if err := copyFile(src, dst); err == nil {
+			_ = os.Remove(src)
+		}
+	}
+}
+
+type WhisperModelInfo struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Filename         string `json:"filename"`
+	URL              string `json:"url"`
+	SizeMB           int    `json:"size_mb"`
+	SpeedLabel       string `json:"speed_label"`
+	SpeedDescription string `json:"speed_description"`
+	Description      string `json:"description"`
+	Language         string `json:"language"`
+	ModelType        string `json:"model_type"` // "whisper" or "llm"
+}
+
+var AvailableModels = []WhisperModelInfo{
+	{
+		ID:               "tiny",
+		Name:             "Tiny (English)",
+		Filename:         "ggml-tiny.en.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+		SizeMB:           75,
+		SpeedLabel:       "Super fast",
+		SpeedDescription: "~10-15x realtime",
+		Description:      "Fastest startup and lowest memory usage.",
+		Language:         "english",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "base",
+		Name:             "Base (English)",
+		Filename:         "ggml-base.en.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+		SizeMB:           142,
+		SpeedLabel:       "Fast",
+		SpeedDescription: "~6-10x realtime",
+		Description:      "Good default for quick dictation.",
+		Language:         "english",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "small",
+		Name:             "Small (English)",
+		Filename:         "ggml-small.en.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+		SizeMB:           465,
+		SpeedLabel:       "Balanced",
+		SpeedDescription: "~2-4x realtime",
+		Description:      "Better accuracy with a noticeable speed cost.",
+		Language:         "english",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "medium",
+		Name:             "Medium (English)",
+		Filename:         "ggml-medium.en.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
+		SizeMB:           1530,
+		SpeedLabel:       "Accurate",
+		SpeedDescription: "~1x realtime",
+		Description:      "High accuracy with heavier CPU and memory usage.",
+		Language:         "english",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "large-turbo",
+		Name:             "Large v3 Turbo",
+		Filename:         "ggml-large-v3-turbo.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+		SizeMB:           1624,
+		SpeedLabel:       "High accuracy",
+		SpeedDescription: "~1-2x realtime",
+		Description:      "Best quality option with optimized inference speed.",
+		Language:         "english",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "tiny-multilingual",
+		Name:             "Tiny (Multilingual)",
+		Filename:         "ggml-tiny.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+		SizeMB:           75,
+		SpeedLabel:       "Super fast",
+		SpeedDescription: "~10-15x realtime",
+		Description:      "Multilingual model. Fastest startup and lowest memory usage.",
+		Language:         "multilingual",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "base-multilingual",
+		Name:             "Base (Multilingual)",
+		Filename:         "ggml-base.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+		SizeMB:           142,
+		SpeedLabel:       "Fast",
+		SpeedDescription: "~6-10x realtime",
+		Description:      "Multilingual model. Balanced speed and accuracy.",
+		Language:         "multilingual",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "small-multilingual",
+		Name:             "Small (Multilingual)",
+		Filename:         "ggml-small.bin",
+		URL:              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+		SizeMB:           465,
+		SpeedLabel:       "Balanced",
+		SpeedDescription: "~2-4x realtime",
+		Description:      "Multilingual model. Better accuracy with a speed cost.",
+		Language:         "multilingual",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "indic-conformer-120m-int8",
+		Name:             "Indic Conformer 120M INT8 (Malayalam)",
+		Filename:         "indicconformer.int8.onnx",
+		URL:              "https://huggingface.co/KarthikSambhuR/indicconformer_stt_ml_hybrid_rnnt_large/resolve/main/model.int8.onnx?download=true",
+		SizeMB:           141,
+		SpeedLabel:       "Blazing Fast (ONNX)",
+		SpeedDescription: "Quantized 8-bit model",
+		Description:      "Quantized 8-bit Indic Conformer 120M model for Malayalam. Extremely fast and lightweight.",
+		Language:         "malayalam",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "indic-conformer-120m-fp32",
+		Name:             "Indic Conformer 120M FP32 (Malayalam)",
+		Filename:         "indicconformer.fp32.onnx",
+		URL:              "https://huggingface.co/KarthikSambhuR/indicconformer_stt_ml_hybrid_rnnt_large/resolve/main/model.fp32.onnx?download=true",
+		SizeMB:           494,
+		SpeedLabel:       "Accurate (ONNX)",
+		SpeedDescription: "Full precision 32-bit model",
+		Description:      "Full precision 32-bit Indic Conformer 120M model for Malayalam. Balanced speed and accuracy.",
+		Language:         "malayalam",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "cactus-whistle",
+		Name:             "Cactus Whistle (Multilingual)",
+		Filename:         "whistle.cact",
+		URL:              "https://huggingface.co/Cactus-Compute/whistle/resolve/main/whistle.cact",
+		SizeMB:           17,
+		SpeedLabel:       "Ultra-compact (17 MB)",
+		SpeedDescription: "2-bit quantized edge ASR",
+		Description:      "Ultra-compact 16.9 MB ASR model by Cactus Compute powered by Needle. Supports English, German, French, Spanish, Italian, Dutch, and Polish.",
+		Language:         "multilingual",
+		ModelType:        "whisper",
+	},
+	{
+		ID:               "smollm2-135m",
+		Name:             "SmolLM2 135M (Refinement)",
+		Filename:         "SmolLM2-135M-Instruct-Q8_0.gguf",
+		URL:              "https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf?download=true",
+		SizeMB:           145,
+		SpeedLabel:       "Ultra Lightweight",
+		SpeedDescription: "Blazing fast inference on any CPU",
+		Description:      "An extremely compact model designed for fast formatting, punctuation cleanup, and spelling correction.",
+		Language:         "english",
+		ModelType:        "llm",
+	},
+	{
+		ID:               "s1-mini",
+		Name:             "S1-mini (Superwhisper Normalizer)",
+		Filename:         "s1-mini-q4_k_m.gguf",
+		URL:              "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf?download=true",
+		SizeMB:           462,
+		SpeedLabel:       "Specialized ASR Normalizer",
+		SpeedDescription: "94.8% token accuracy text normalizer built specifically for dictation",
+		Description:      "A specialized 0.6B model by Superwhisper for cleaning speech-to-text transcripts, resolving self-corrections, removing fillers, and formatting dates/numbers/punctuation.",
+		Language:         "english",
+		ModelType:        "llm",
+	},
+	{
+		ID:               "qwen3-0.6b",
+		Name:             "Qwen 3 0.6B (Refinement)",
+		Filename:         "Qwen3-0.6B-UD-Q4_K_XL.gguf",
+		URL:              "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-UD-Q4_K_XL.gguf?download=true",
+		SizeMB:           418,
+		SpeedLabel:       "Fast & Lightweight",
+		SpeedDescription: "Optimized for grammar and formatting correction",
+		Description:      "A small but highly capable model for real-time formatting, grammar, and stutter correction.",
+		Language:         "english",
+		ModelType:        "llm",
+	},
+	{
+		ID:               "gemma4-e2b",
+		Name:             "Gemma 4 E2B (Refinement)",
+		Filename:         "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
+		URL:              "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-UD-Q4_K_XL.gguf?download=true",
+		SizeMB:           3246,
+		SpeedLabel:       "High Quality",
+		SpeedDescription: "Intelligent and expressive refinement",
+		Description:      "Gemma 4 E2B model optimized for premium-quality formatting, context preservation, and grammar correction.",
+		Language:         "english",
+		ModelType:        "llm",
+	},
+	{
+		ID:               "sarvam-1-3b",
+		Name:             "Sarvam 1 3B (Refinement)",
+		Filename:         "sarvam-1-Q4_K_M.gguf",
+		URL:              "https://huggingface.co/bartowski/sarvam-1-GGUF/resolve/main/sarvam-1-Q4_K_M.gguf?download=true",
+		SizeMB:           1250,
+		SpeedLabel:       "Balanced",
+		SpeedDescription: "Bilingual English/Malayalam model",
+		Description:      "Sarvam 1 3B model optimized for English and Malayalam text refinement.",
+		Language:         "malayalam",
+		ModelType:        "llm",
+	},
+	{
+		ID:               "gemma4-e2b-audio",
+		Name:             "Gemma 4 E2B (Direct Audio STT)",
+		Filename:         "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
+		URL:              "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-UD-Q4_K_XL.gguf?download=true",
+		SizeMB:           3246,
+		SpeedLabel:       "Direct Audio (RTF ~0.08)",
+		SpeedDescription: "Directly processes audio on GPU",
+		Description:      "Gemma 4 E2B model operating as direct audio-to-text transcriber.",
+		Language:         "multilingual",
+		ModelType:        "whisper",
+	},
+}
+
+type ModelStatus struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Filename         string `json:"filename"`
+	SizeMB           int    `json:"size_mb"`
+	SpeedLabel       string `json:"speed_label"`
+	SpeedDescription string `json:"speed_description"`
+	Description      string `json:"description"`
+	IsDownloaded     bool   `json:"is_downloaded"`
+	IsActive         bool   `json:"is_active"`
+	IsDownloading    bool   `json:"is_downloading"`
+	DownloadProgress int    `json:"download_progress"`
+	Language         string `json:"language"`
+	ModelType        string `json:"model_type"`
+	IsDisabled       bool   `json:"is_disabled"`
+}
+
+var (
+	downloadLock     sync.Mutex
+	downloadProgress = make(map[string]int) // modelID -> percent
+)
+
+func (s *SettingsApp) GetModelsList() []ModelStatus {
+	cfg := loadConfig()
+	activeFilename := cfg.ActiveModel
+	if activeFilename == "" {
+		activeFilename = "ggml-tiny.en.bin"
+	}
+
+	modelsDir := s.getModelsDir()
+	_ = os.MkdirAll(modelsDir, 0755)
+
+	downloadLock.Lock()
+	defer downloadLock.Unlock()
+
+	var out []ModelStatus
+	for _, m := range AvailableModels {
+		pathInCustom := filepath.Join(modelsDir, m.Filename)
+		pathInLocal := filepath.Join("models", m.Filename)
+
+		isDownloaded := false
+		if m.ID == "indic-conformer-120m-int8" || m.ID == "indic-conformer-120m-fp32" {
+			tokenizerPath := filepath.Join(modelsDir, "tokenizer.model")
+			modelPathCustom := filepath.Join(modelsDir, m.Filename)
+			modelPathLocal := filepath.Join("models", m.Filename)
+			_, errT := os.Stat(tokenizerPath)
+			_, errM1 := os.Stat(modelPathCustom)
+			_, errM2 := os.Stat(modelPathLocal)
+			if errT == nil && (errM1 == nil || errM2 == nil) {
+				isDownloaded = true
+			}
+		} else if m.ID == "gemma4-e2b-audio" {
+			projPathCustom := filepath.Join(modelsDir, "gemma-4-e2b-mmproj-BF16.gguf")
+			projPathLocal := filepath.Join("models", "gemma-4-e2b-mmproj-BF16.gguf")
+			_, errProjCustom := os.Stat(projPathCustom)
+			_, errProjLocal := os.Stat(projPathLocal)
+			hasProj := errProjCustom == nil || errProjLocal == nil
+
+			_, errModelCustom := os.Stat(pathInCustom)
+			_, errModelLocal := os.Stat(pathInLocal)
+			hasModel := errModelCustom == nil || errModelLocal == nil
+
+			isDownloaded = hasProj && hasModel
+		} else {
+			if _, err := os.Stat(pathInCustom); err == nil {
+				isDownloaded = true
+			} else if _, err := os.Stat(pathInLocal); err == nil {
+				isDownloaded = true
+			}
+		}
+
+		progress, isDownloading := downloadProgress[m.ID]
+
+		isActive := m.Filename == activeFilename
+		if m.ModelType == "llm" {
+			isActive = m.Filename == cfg.LLMActiveModel
+		}
+
+		isDisabled := false
+		isConformerActive := activeFilename == "indicconformer.int8.onnx" || activeFilename == "indicconformer.fp32.onnx"
+		isGemmaAudioActive := activeFilename == "gemma-4-E2B-it-UD-Q4_K_XL.gguf"
+		if isConformerActive && m.ModelType == "llm" && m.ID != "gemma4-e2b" && m.ID != "sarvam-1-3b" {
+			isDisabled = true
+		} else if isGemmaAudioActive && m.ModelType == "llm" && m.ID != "gemma4-e2b" {
+			isDisabled = true
+		}
+
+		out = append(out, ModelStatus{
+			ID:               m.ID,
+			Name:             m.Name,
+			Filename:         m.Filename,
+			SizeMB:           m.SizeMB,
+			SpeedLabel:       m.SpeedLabel,
+			SpeedDescription: m.SpeedDescription,
+			Description:      m.Description,
+			IsDownloaded:     isDownloaded,
+			IsActive:         isActive,
+			IsDownloading:    isDownloading,
+			DownloadProgress: progress,
+			Language:         m.Language,
+			ModelType:        m.ModelType,
+			IsDisabled:       isDisabled,
+		})
+	}
+	return out
+}
+
+func (s *SettingsApp) getModelsDir() string {
+	cfg := loadConfig()
+	return filepath.Join(getDataDir(cfg), "models")
+}
+
+func (s *SettingsApp) ensureModelInDataFolder(filename string) error {
+	modelsDir := s.getModelsDir()
+	targetPath := filepath.Join(modelsDir, filename)
+
+	if filename == "indicconformer.int8.onnx" || filename == "indicconformer.fp32.onnx" {
+		tokenizerTarget := filepath.Join(modelsDir, "tokenizer.model")
+		if !fileExists(tokenizerTarget) {
+			legacyTokenizer := filepath.Join("models", "tokenizer.model")
+			if fileExists(legacyTokenizer) {
+				if err := copyFile(legacyTokenizer, tokenizerTarget); err == nil {
+					_ = os.Remove(legacyTokenizer)
+				}
+			}
+		}
+		if !fileExists(tokenizerTarget) {
+			return fmt.Errorf("tokenizer.model is not downloaded")
+		}
+	}
+
+	if fileExists(targetPath) {
+		return nil
+	}
+
+	legacyPath := filepath.Join("models", filename)
+	if fileExists(legacyPath) {
+		if err := copyFile(legacyPath, targetPath); err != nil {
+			return err
+		}
+		_ = os.Remove(legacyPath)
+		return nil
+	}
+
+	return fmt.Errorf("model file %s is not downloaded", filename)
+}
+
+// WriteCounter counts the number of bytes written to it and publishes progress.
+type WriteCounter struct {
+	Total      uint64
+	ContentLen uint64
+	StartTime  time.Time
+	LastUpdate time.Time
+	OnProgress func(percent int, speed float64, eta time.Duration)
+}
+
+func (wc *WriteCounter) Write(p []byte) (int, error) {
+	n := len(p)
+	wc.Total += uint64(n)
+	if wc.ContentLen > 0 {
+		now := time.Now()
+		if now.Sub(wc.LastUpdate) >= 1*time.Second || wc.Total == wc.ContentLen {
+			wc.LastUpdate = now
+			percent := int((float64(wc.Total) / float64(wc.ContentLen)) * 100)
+			if percent > 100 {
+				percent = 100
+			}
+
+			elapsed := now.Sub(wc.StartTime)
+			var speed float64
+			var eta time.Duration
+			if elapsed > 0 {
+				speed = float64(wc.Total) / elapsed.Seconds()
+				if speed > 0 {
+					remainingBytes := wc.ContentLen - wc.Total
+					eta = time.Duration(float64(remainingBytes)/speed) * time.Second
+				}
+			}
+
+			wc.OnProgress(percent, speed, eta)
+		}
+	}
+	return n, nil
+}
+
+func formatBytes(bytes float64) string {
+	if bytes >= 1024*1024*1024 {
+		return fmt.Sprintf("%.2f GB", bytes/(1024*1024*1024))
+	}
+	if bytes >= 1024*1024 {
+		return fmt.Sprintf("%.2f MB", bytes/(1024*1024))
+	}
+	if bytes >= 1024 {
+		return fmt.Sprintf("%.2f KB", bytes/1024)
+	}
+	return fmt.Sprintf("%.0f B", bytes)
+}
+
+func formatDuration(d time.Duration) string {
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	if h > 0 {
+		return fmt.Sprintf("%dh %dm %ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+func (s *SettingsApp) DownloadModel(id string) {
+	downloadLock.Lock()
+	if _, exists := downloadProgress[id]; exists {
+		downloadLock.Unlock()
+		return
+	}
+	downloadProgress[id] = 0
+	downloadLock.Unlock()
+
+	var targetModel *WhisperModelInfo
+	for i := range AvailableModels {
+		if AvailableModels[i].ID == id {
+			targetModel = &AvailableModels[i]
+			break
+		}
+	}
+	if targetModel == nil {
+		downloadLock.Lock()
+		delete(downloadProgress, id)
+		downloadLock.Unlock()
+		return
+	}
+
+	go func() {
+		defer func() {
+			downloadLock.Lock()
+			delete(downloadProgress, id)
+			downloadLock.Unlock()
+		}()
+
+		modelsDir := s.getModelsDir()
+		_ = os.MkdirAll(modelsDir, 0755)
+
+		if id == "indic-conformer-120m-int8" || id == "indic-conformer-120m-fp32" {
+			tokenizerPath := filepath.Join(modelsDir, "tokenizer.model")
+			if _, err := os.Stat(tokenizerPath); err != nil {
+				fmt.Println("Downloading tokenizer.model...")
+				tokenizerURL := "https://huggingface.co/KarthikSambhuR/indicconformer_stt_ml_hybrid_rnnt_large/resolve/main/tokenizer.model?download=true"
+				respTok, errTok := http.Get(tokenizerURL)
+				if errTok == nil && respTok.StatusCode == http.StatusOK {
+					tokTmp := tokenizerPath + ".tmp"
+					outTok, errCreate := os.Create(tokTmp)
+					if errCreate == nil {
+						_, errCopy := io.Copy(outTok, respTok.Body)
+						outTok.Close()
+						respTok.Body.Close()
+						if errCopy == nil {
+							_ = os.Rename(tokTmp, tokenizerPath)
+							fmt.Println("Successfully downloaded tokenizer.model")
+						} else {
+							_ = os.Remove(tokTmp)
+						}
+					} else {
+						respTok.Body.Close()
+					}
+				} else if errTok == nil {
+					respTok.Body.Close()
+				}
+			}
+		}
+
+		if id == "gemma4-e2b-audio" {
+			projPath := filepath.Join(modelsDir, "gemma-4-e2b-mmproj-BF16.gguf")
+			if _, err := os.Stat(projPath); err != nil {
+				fmt.Println("Downloading gemma-4-e2b-mmproj-BF16.gguf...")
+				projURL := "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/mmproj-BF16.gguf?download=true"
+				respProj, errProj := http.Get(projURL)
+				if errProj == nil && respProj.StatusCode == http.StatusOK {
+					projTmp := projPath + ".tmp"
+					outProj, errCreate := os.Create(projTmp)
+					if errCreate == nil {
+						_, errCopy := io.Copy(outProj, respProj.Body)
+						outProj.Close()
+						respProj.Body.Close()
+						if errCopy == nil {
+							_ = os.Rename(projTmp, projPath)
+							fmt.Println("Successfully downloaded gemma-4-e2b-mmproj-BF16.gguf")
+						} else {
+							_ = os.Remove(projTmp)
+						}
+					} else {
+						respProj.Body.Close()
+					}
+				} else if errProj == nil {
+					respProj.Body.Close()
+				}
+			}
+		}
+
+		tmpPath := filepath.Join(modelsDir, targetModel.Filename+".tmp")
+		finalPath := filepath.Join(modelsDir, targetModel.Filename)
+
+		resp, err := http.Get(targetModel.URL)
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "model-download-error", id, err.Error())
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			wailsRuntime.EventsEmit(s.ctx, "model-download-error", id, fmt.Sprintf("HTTP %d", resp.StatusCode))
+			return
+		}
+
+		out, err := os.Create(tmpPath)
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "model-download-error", id, err.Error())
+			return
+		}
+		defer func() {
+			out.Close()
+			_ = os.Remove(tmpPath)
+		}()
+
+		startTime := time.Now()
+		counter := &WriteCounter{
+			ContentLen: uint64(resp.ContentLength),
+			StartTime:  startTime,
+			LastUpdate: startTime,
+			OnProgress: func(percent int, speed float64, eta time.Duration) {
+				downloadLock.Lock()
+				downloadProgress[id] = percent
+				downloadLock.Unlock()
+				
+				speedStr := formatBytes(speed) + "/s"
+				etaStr := formatDuration(eta)
+				wailsRuntime.EventsEmit(s.ctx, "model-download-progress", id, percent, speedStr, etaStr)
+			},
+		}
+
+		_, err = io.Copy(out, io.TeeReader(resp.Body, counter))
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "model-download-error", id, err.Error())
+			return
+		}
+
+		out.Close()
+
+		err = os.Rename(tmpPath, finalPath)
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "model-download-error", id, err.Error())
+			return
+		}
+
+		if strings.HasSuffix(targetModel.Filename, ".zip") {
+			err = unzip(finalPath, modelsDir)
+			_ = os.Remove(finalPath) // clean up zip
+			if err != nil {
+				wailsRuntime.EventsEmit(s.ctx, "model-download-error", id, "Failed to unzip: "+err.Error())
+				return
+			}
+		}
+
+		wailsRuntime.EventsEmit(s.ctx, "model-download-done", id)
+	}()
+}
+
+func (s *SettingsApp) SetActiveModel(id string) error {
+	var targetModel *WhisperModelInfo
+	for i := range AvailableModels {
+		if AvailableModels[i].ID == id {
+			targetModel = &AvailableModels[i]
+			break
+		}
+	}
+	if targetModel == nil {
+		return fmt.Errorf("unknown model ID: %s", id)
+	}
+
+	// For the conformer model (.zip), verify the extracted folder exists.
+	// For all other models, ensure the binary file is in the data folder.
+	if err := s.ensureModelInDataFolder(targetModel.Filename); err != nil {
+		return err
+	}
+
+	cfg := loadConfig()
+	isConformerActive := targetModel.Filename == "indicconformer.int8.onnx" || targetModel.Filename == "indicconformer.fp32.onnx"
+	isGemmaAudioActive := targetModel.Filename == "gemma-4-E2B-it-UD-Q4_K_XL.gguf" && targetModel.ModelType == "whisper"
+	if targetModel.ModelType == "llm" {
+		isConfigConformerActive := cfg.ActiveModel == "indicconformer.int8.onnx" || cfg.ActiveModel == "indicconformer.fp32.onnx"
+		isConfigGemmaAudioActive := cfg.ActiveModel == "gemma-4-E2B-it-UD-Q4_K_XL.gguf"
+		if isConfigConformerActive && targetModel.ID != "gemma4-e2b" && targetModel.ID != "sarvam-1-3b" {
+			return fmt.Errorf("Only Gemma and Sarvam are selectable with the Malayalam Conformer model")
+		}
+		if isConfigGemmaAudioActive && targetModel.ID != "gemma4-e2b" {
+			return fmt.Errorf("Only Gemma is selectable with the Gemma Direct Audio STT model")
+		}
+		cfg.LLMActiveModel = targetModel.Filename
+	} else if isConformerActive {
+		cfg.ActiveModel = targetModel.Filename
+		// Automatically switch active LLM to Gemma
+		cfg.LLMActiveModel = "gemma-4-E2B-it-UD-Q4_K_XL.gguf"
+	} else if isGemmaAudioActive {
+		cfg.ActiveModel = targetModel.Filename
+		// Automatically switch active LLM to Gemma
+		cfg.LLMActiveModel = "gemma-4-E2B-it-UD-Q4_K_XL.gguf"
+	} else {
+		cfg.ActiveModel = targetModel.Filename
+	}
+	return saveConfig(cfg)
+}
+
+func (s *SettingsApp) DeleteModel(filename string) error {
+	var targetModel *WhisperModelInfo
+	for i := range AvailableModels {
+		if AvailableModels[i].Filename == filename {
+			targetModel = &AvailableModels[i]
+			break
+		}
+	}
+	if targetModel == nil {
+		return fmt.Errorf("model info not found")
+	}
+
+	modelsDir := s.getModelsDir()
+
+	downloadedList := []string{}
+	for _, m := range AvailableModels {
+		if m.ModelType != targetModel.ModelType {
+			continue
+		}
+		if m.ID == "indic-conformer-ml" {
+			downloadedFolder := filepath.Join(modelsDir, "indic-conformer-600m-multilingual")
+			if _, err := os.Stat(downloadedFolder); err == nil {
+				downloadedList = append(downloadedList, downloadedFolder)
+			}
+		} else {
+			pathInCustom := filepath.Join(modelsDir, m.Filename)
+			pathInLocal := filepath.Join("models", m.Filename)
+
+			if _, err := os.Stat(pathInCustom); err == nil {
+				downloadedList = append(downloadedList, pathInCustom)
+			} else if _, err := os.Stat(pathInLocal); err == nil {
+				downloadedList = append(downloadedList, pathInLocal)
+			}
+		}
+	}
+
+	if len(downloadedList) <= 1 {
+		return fmt.Errorf("cannot delete the only %s model left on disk; download another model first", targetModel.ModelType)
+	}
+
+	var pathToDelete string
+
+	pathInCustom := filepath.Join(modelsDir, filename)
+	pathInLocal := filepath.Join("models", filename)
+
+	if _, err := os.Stat(pathInCustom); err == nil {
+		pathToDelete = pathInCustom
+	} else if _, err := os.Stat(pathInLocal); err == nil {
+		pathToDelete = pathInLocal
+	} else {
+		return fmt.Errorf("model file not found on disk")
+	}
+
+	err := os.Remove(pathToDelete)
+	if err != nil {
+		return err
+	}
+
+	if filename == "indicconformer.int8.onnx" || filename == "indicconformer.fp32.onnx" {
+		otherFilename := "indicconformer.fp32.onnx"
+		if filename == "indicconformer.fp32.onnx" {
+			otherFilename = "indicconformer.int8.onnx"
+		}
+		pOtherC := filepath.Join(modelsDir, otherFilename)
+		pOtherL := filepath.Join("models", otherFilename)
+		_, errOtherC := os.Stat(pOtherC)
+		_, errOtherL := os.Stat(pOtherL)
+		if errOtherC != nil && errOtherL != nil {
+			_ = os.Remove(filepath.Join(modelsDir, "tokenizer.model"))
+			_ = os.Remove(filepath.Join("models", "tokenizer.model"))
+		}
+	}
+
+	cfg := loadConfig()
+	if targetModel.ModelType == "llm" {
+		if cfg.LLMActiveModel == filename {
+			for _, m := range AvailableModels {
+				if m.ModelType != "llm" || m.Filename == filename {
+					continue
+				}
+				pC := filepath.Join(modelsDir, m.Filename)
+				pL := filepath.Join("models", m.Filename)
+				if _, err := os.Stat(pC); err == nil {
+					cfg.LLMActiveModel = m.Filename
+					break
+				} else if _, err := os.Stat(pL); err == nil {
+					cfg.LLMActiveModel = m.Filename
+					break
+				}
+			}
+			_ = saveConfig(cfg)
+		}
+	} else {
+		if cfg.ActiveModel == filename {
+			for _, m := range AvailableModels {
+				if m.ModelType == "llm" || m.Filename == filename {
+					continue
+				}
+				pC := filepath.Join(modelsDir, m.Filename)
+				pL := filepath.Join("models", m.Filename)
+				if _, err := os.Stat(pC); err == nil {
+					cfg.ActiveModel = m.Filename
+					break
+				} else if _, err := os.Stat(pL); err == nil {
+					cfg.ActiveModel = m.Filename
+					break
+				}
+			}
+			_ = saveConfig(cfg)
+		}
+	}
+
+	return nil
+}
+
+func (s *SettingsApp) IsSetupCompleted() bool {
+	return GetProfileValue("setup_completed") == "true"
+}
+
+func (s *SettingsApp) GetProfileName() string {
+	return GetProfileValue("username")
+}
+
+func (s *SettingsApp) SetProfileName(name string) {
+	_ = SetProfileValue("username", name)
+	_ = SetProfileValue("setup_completed", "true")
+
+	// Start the main dictation process (pill overlay) in the background
+	selfPath, err := os.Executable()
+	if err == nil {
+		_ = exec.Command(selfPath, "--pill-only").Start()
+	}
+}
+
+func (s *SettingsApp) DownloadEssentialAssets() {
+	go func() {
+		cfg := loadConfig()
+		dataDir := getBaseAppDir()
+		if cfg.DataFolder != "" && cfg.DataFolder != "Default" {
+			dataDir = cfg.DataFolder
+		}
+
+		fontsDir := filepath.Join(dataDir, "fonts")
+		modelsDir := filepath.Join(dataDir, "models")
+		_ = os.MkdirAll(fontsDir, 0755)
+		_ = os.MkdirAll(modelsDir, 0755)
+
+		// 1. Download Urbanist Variable Font
+		wailsRuntime.EventsEmit(s.ctx, "setup-progress", 0, "Downloading Urbanist font...")
+		urbanistURL := "https://raw.githubusercontent.com/google/fonts/main/ofl/urbanist/Urbanist%5Bwght%5D.ttf"
+		urbanistPath := filepath.Join(fontsDir, "Urbanist-Variable.ttf")
+		if err := downloadFileDirect(urbanistURL, urbanistPath); err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "setup-error", fmt.Sprintf("Failed to download Urbanist font: %v", err))
+			return
+		}
+
+		// 3. Download Whisper Tiny Model
+		wailsRuntime.EventsEmit(s.ctx, "setup-progress", 20, "Downloading default Whisper Tiny model (75 MB)...")
+
+		var tinyModel *WhisperModelInfo
+		for i := range AvailableModels {
+			if AvailableModels[i].ID == "tiny" {
+				tinyModel = &AvailableModels[i]
+				break
+			}
+		}
+		if tinyModel == nil {
+			wailsRuntime.EventsEmit(s.ctx, "setup-error", "Model info not found")
+			return
+		}
+
+		tmpModelPath := filepath.Join(modelsDir, tinyModel.Filename+".tmp")
+		finalModelPath := filepath.Join(modelsDir, tinyModel.Filename)
+
+		resp, err := http.Get(tinyModel.URL)
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "setup-error", fmt.Sprintf("Failed to download model: %v", err))
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			wailsRuntime.EventsEmit(s.ctx, "setup-error", fmt.Sprintf("Failed to download model: HTTP %d", resp.StatusCode))
+			return
+		}
+
+		out, err := os.Create(tmpModelPath)
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "setup-error", fmt.Sprintf("Failed to create file: %v", err))
+			return
+		}
+		defer func() {
+			out.Close()
+			_ = os.Remove(tmpModelPath)
+		}()
+
+		startTime := time.Now()
+		counter := &WriteCounter{
+			ContentLen: uint64(resp.ContentLength),
+			StartTime:  startTime,
+			LastUpdate: startTime,
+			OnProgress: func(percent int, speed float64, eta time.Duration) {
+				overallPercent := 20 + int(float64(percent)*0.8)
+				speedStr := formatBytes(speed) + "/s"
+				etaStr := formatDuration(eta)
+				wailsRuntime.EventsEmit(s.ctx, "setup-progress", overallPercent, fmt.Sprintf("Downloading Whisper Tiny model... %d%% (%s, ETA: %s)", percent, speedStr, etaStr))
+			},
+		}
+
+		_, err = io.Copy(out, io.TeeReader(resp.Body, counter))
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "setup-error", fmt.Sprintf("Download stream interrupted: %v", err))
+			return
+		}
+		out.Close()
+
+		err = os.Rename(tmpModelPath, finalModelPath)
+		if err != nil {
+			wailsRuntime.EventsEmit(s.ctx, "setup-error", fmt.Sprintf("Failed to finalize model file: %v", err))
+			return
+		}
+
+		// Automatically set the downloaded Tiny model as the active model in the config
+		cfg.ActiveModel = tinyModel.Filename
+		_ = saveConfig(cfg)
+
+		wailsRuntime.EventsEmit(s.ctx, "setup-progress", 100, "Downloads complete!")
+		wailsRuntime.EventsEmit(s.ctx, "setup-done")
+	}()
+}
+
+func downloadFileDirect(url string, filepath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+func (s *SettingsApp) AddDictionaryWord(word string) error {
+	return AddDictionaryWord(word)
+}
+
+func (s *SettingsApp) DeleteDictionaryWord(word string) error {
+	return DeleteDictionaryWord(word)
+}
+
+func (s *SettingsApp) GetDictionaryWords() []string {
+	words, _ := GetDictionaryWords()
+	if words == nil {
+		return []string{}
+	}
+	return words
+}
+
+func (s *SettingsApp) SetLLMEnabled(enabled bool) {
+	cfg := loadConfig()
+	cfg.LLMEnabled = enabled
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetLLMRefinementMode(mode string) error {
+	cfg := loadConfig()
+	cfg.LLMRefinementMode = normalizeLLMRefinementMode(mode)
+	return saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetLLMTone(tone string) error {
+	cfg := loadConfig()
+	cfg.LLMTone = normalizeLLMTone(tone)
+	return saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetLLMContextSize(size int) error {
+	cfg := loadConfig()
+	cfg.LLMContextSize = normalizeLLMContextSize(size)
+	return saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetManglishEnabled(enabled bool) {
+	cfg := loadConfig()
+	cfg.ManglishEnabled = enabled
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetBilingualRoutingEnabled(enabled bool) {
+	cfg := loadConfig()
+	cfg.BilingualRoutingEnabled = enabled
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetBilingualWhisperModel(filename string) {
+	cfg := loadConfig()
+	cfg.BilingualWhisperModel = filename
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetBilingualConformerModel(filename string) {
+	cfg := loadConfig()
+	cfg.BilingualConformerModel = filename
+	saveConfig(cfg)
+}
+
+func (s *SettingsApp) SetManglishExamples(ex1, ex2, ex3, ex4, ex5 string) error {
+	cfg := loadConfig()
+	cfg.ManglishExample1 = ex1
+	cfg.ManglishExample2 = ex2
+	cfg.ManglishExample3 = ex3
+	cfg.ManglishExample4 = ex4
+	cfg.ManglishExample5 = ex5
+	return saveConfig(cfg)
+}
+
+func (s *SettingsApp) AddTransliteration(malayalam, translit string) error {
+	return AddTransliteration(malayalam, translit)
+}
+
+func (s *SettingsApp) DeleteTransliteration(malayalam string) error {
+	return DeleteTransliteration(malayalam)
+}
+
+func (s *SettingsApp) GetTransliterations() ([]WordMapping, error) {
+	return GetTransliterations()
+}
+
+
+func unzip(src string, dest string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		fpath := filepath.Join(dest, f.Name)
+
+		// Check for Zip Slip vulnerability
+		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
+			return fmt.Errorf("%s: illegal file path", fpath)
+		}
+
+		if f.FileInfo().IsDir() {
+			_ = os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
+
+		if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+
+		outFile.Close()
+		rc.Close()
+
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ── Meeting Mode API ─────────────────────────────────────────────────────────
+
+func (s *SettingsApp) StartMeeting(title string) (string, error) {
+	return GetMeetingEngine().StartRecording(title)
+}
+
+func (s *SettingsApp) StopMeeting() (string, error) {
+	return GetMeetingEngine().StopRecording()
+}
+
+func (s *SettingsApp) IsMeetingRecording() bool {
+	return GetMeetingEngine().IsRecording()
+}
+
+func (s *SettingsApp) GetMeetingsList() ([]Meeting, error) {
+	return GetMeetings()
+}
+
+func (s *SettingsApp) GetMeeting(id string) (*MeetingDetail, error) {
+	return GetMeetingDetail(id)
+}
+
+func (s *SettingsApp) DeleteMeetingRecord(id string) error {
+	return DeleteMeeting(id)
+}
+
+func (s *SettingsApp) RegenerateMeetingSummary(id string) (string, error) {
+	detail, err := GetMeetingDetail(id)
+	if err != nil {
+		return "", err
+	}
+	if detail.Meeting.FullTranscript == "" {
+		return "No dialogue transcript found for this meeting.", nil
+	}
+
+	engine := GetMeetingEngine()
+	if engine.ctx != nil {
+		wailsRuntime.EventsEmit(engine.ctx, "meeting-summary-generating", id)
+	}
+
+	go func() {
+		summary, shortSummary, err := generateMeetingSummary(detail.Meeting.FullTranscript)
+		if err != nil {
+			summary = fmt.Sprintf("Summary generation encountered an error: %v\n\nFull dialogue is saved in transcript.", err)
+			shortSummary = ""
+		}
+		_ = UpdateMeetingSummary(id, summary, shortSummary, detail.Meeting.FullTranscript, detail.Meeting.DurationSeconds)
+		if engine.ctx != nil {
+			wailsRuntime.EventsEmit(engine.ctx, "meeting-summary-completed", map[string]interface{}{
+				"id":               id,
+				"meeting_id":       id,
+				"summary":          summary,
+				"summary_markdown": summary,
+				"short_summary":    shortSummary,
+			})
+		}
+	}()
+
+	return "Generating summary in background...", nil
+}
+
+type DetectedBrowser struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	Installed bool   `json:"installed"`
+	URL       string `json:"url"`
+}
+
+func (s *SettingsApp) GetInstalledBrowsers() []DetectedBrowser {
+	var browsers []DetectedBrowser
+
+	localAppData := os.Getenv("LOCALAPPDATA")
+	progFiles := os.Getenv("ProgramFiles")
+	progFilesX86 := os.Getenv("ProgramFiles(x86)")
+
+	candidates := []struct {
+		id    string
+		name  string
+		paths []string
+		url   string
+	}{
+		{
+			id:   "chrome",
+			name: "Google Chrome",
+			paths: []string{
+				filepath.Join(progFiles, "Google", "Chrome", "Application", "chrome.exe"),
+				filepath.Join(progFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+				filepath.Join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+			},
+			url: "chrome://extensions",
+		},
+		{
+			id:   "edge",
+			name: "Microsoft Edge",
+			paths: []string{
+				filepath.Join(progFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+				filepath.Join(progFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+			},
+			url: "edge://extensions",
+		},
+		{
+			id:   "brave",
+			name: "Brave Browser",
+			paths: []string{
+				filepath.Join(progFiles, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+				filepath.Join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+			},
+			url: "brave://extensions",
+		},
+		{
+			id:   "opera",
+			name: "Opera",
+			paths: []string{
+				filepath.Join(localAppData, "Programs", "Opera", "launcher.exe"),
+				filepath.Join(progFiles, "Opera", "launcher.exe"),
+			},
+			url: "opera://extensions",
+		},
+		{
+			id:   "vivaldi",
+			name: "Vivaldi",
+			paths: []string{
+				filepath.Join(localAppData, "Vivaldi", "Application", "vivaldi.exe"),
+				filepath.Join(progFiles, "Vivaldi", "Application", "vivaldi.exe"),
+			},
+			url: "vivaldi://extensions",
+		},
+	}
+
+	for _, c := range candidates {
+		foundPath := ""
+		for _, p := range c.paths {
+			if _, err := os.Stat(p); err == nil {
+				foundPath = p
+				break
+			}
+		}
+		if foundPath != "" {
+			browsers = append(browsers, DetectedBrowser{
+				ID:        c.id,
+				Name:      c.name,
+				Path:      foundPath,
+				Installed: true,
+				URL:       c.url,
+			})
+		}
+	}
+
+	return browsers
+}
+
+func (s *SettingsApp) GetExtensionPath() string {
+	candidates := []string{
+		"extension",
+		filepath.Join(".", "extension"),
+		filepath.Join(getBaseAppDir(), "extension"),
+		filepath.Join(filepath.Dir(getBaseAppDir()), "extension"),
+	}
+
+	// Add search from current working directory
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, "extension"))
+		// Check parent dirs
+		dir := cwd
+		for i := 0; i < 4; i++ {
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			candidates = append(candidates, filepath.Join(parent, "extension"))
+			dir = parent
+		}
+	}
+
+	// Add search from executable directory
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates = append(candidates, filepath.Join(exeDir, "extension"))
+		dir := exeDir
+		for i := 0; i < 4; i++ {
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			candidates = append(candidates, filepath.Join(parent, "extension"))
+			dir = parent
+		}
+	}
+
+	for _, c := range candidates {
+		if abs, err := filepath.Abs(c); err == nil {
+			if info, err := os.Stat(abs); err == nil && info.IsDir() {
+				// Verify manifest.json exists inside
+				if _, err := os.Stat(filepath.Join(abs, "manifest.json")); err == nil {
+					return abs
+				}
+			}
+		}
+	}
+
+	abs, _ := filepath.Abs("extension")
+	return abs
+}
+
+func (s *SettingsApp) OpenBrowserExtensionPage(browserPath string, extensionsURL string) error {
+	extDir := s.GetExtensionPath()
+
+	// 1. Copy extension path to Windows clipboard so the user can easily paste it into the folder dialog
+	_ = clipboard.WriteAll(extDir)
+
+	// 2. Open browser and navigate to its extensions page via SendKeys
+	go func() {
+		targetURL := extensionsURL
+		if targetURL == "" {
+			targetURL = "chrome://extensions"
+		}
+		var psCmd string
+		if browserPath != "" {
+			psCmd = fmt.Sprintf(`Start-Process -FilePath '%s'; Start-Sleep -Milliseconds 600; $wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys('^l'); Start-Sleep -Milliseconds 120; $wshell.SendKeys('%s{ENTER}')`, browserPath, targetURL)
+		} else {
+			psCmd = fmt.Sprintf(`Start-Process chrome; Start-Sleep -Milliseconds 600; $wshell = New-Object -ComObject wscript.shell; $wshell.SendKeys('^l'); Start-Sleep -Milliseconds 120; $wshell.SendKeys('%s{ENTER}')`, targetURL)
+		}
+		_ = exec.Command("powershell", "-NoProfile", "-Command", psCmd).Start()
+	}()
+
+	return nil
+}
+
+func (s *SettingsApp) IsExtensionConnected() bool {
+	globalExtensionServer.mutex.Lock()
+	defer globalExtensionServer.mutex.Unlock()
+	return globalExtensionServer.activeClient != nil
+}
+
