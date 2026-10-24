@@ -7,7 +7,7 @@ Complete this file during the hackathon and use it to prepare your submission th
 - **Project name:** LocalFlow
 - **Short description:** Offline-first Windows dictation and meeting transcription with local speech and text models.
 - **Code repository URL:** https://github.com/KarthikSambhuR/DevinHacksKochi
-- **Final submitted implementation commit SHA:** TODO
+- **Current pushed implementation commit SHA:** `de300ea5162946d9ca4540c8bde90ea7058a9767` (update to the final submitted implementation commit before submission).
 - **Working demo URL or local demo steps:** TODO
 - **Demo access requirements:** TODO — explain any prerequisites without including private credentials.
 

@@ -1,5 +1,12 @@
 # Change log
 
+## 2026-10-25T00:17:26+05:30 — Record the pushed implementation revision
+
+- Changed: recorded the current pushed implementation SHA in `SUBMISSION.md`.
+- Why: make the code revision easy to identify while leaving the final submission SHA pending until the project is submitted.
+- Validation: confirmed `de300ea5162946d9ca4540c8bde90ea7058a9767` is pushed to the repository's main branch.
+- Limitations: team and demo details remain to be completed before submission.
+
 ## 2026-10-25T00:14:40+05:30 — Harden meeting transcription and browser companion
 
 - Changed: imported the current LocalFlow meeting and extension updates, including participant roster replay, socket/tab lifecycle handling, speaker-attribution safeguards, meeting-specific model routing, stop/finalization fixes, and regression coverage. See `MEETING_AUDIT.md` for details and remaining risks.
