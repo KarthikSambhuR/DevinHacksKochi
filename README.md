@@ -49,10 +49,12 @@ The application may need model files downloaded through its model settings befor
 ### Checks
 
 ```powershell
+cd frontend
+npm ci
+npm run build
+cd ..
 go test ./...
 node --test extension/bridge.test.cjs
-cd frontend
-npm run build
 ```
 
 Run checks from the repository root unless the command says otherwise. Record the actual result in `CHANGELOG.md` when making a change.
@@ -69,7 +71,7 @@ Run checks from the repository root unless the command says otherwise. Record th
 ## Current status
 
 - Working features: dictation, transcript management, meeting transcription, model settings, and browser companion integration are implemented in the repository.
-- Known limitations: Windows is the supported desktop target; model downloads and browser companion setup are separate user steps. Add any additional known limitations after testing.
+- Known limitations: Windows is the supported desktop target; model downloads and browser companion setup are separate user steps. Meeting-platform selectors and speaker attribution still need live validation. The app records mixed microphone/system audio rather than isolated speaker tracks, and the local browser bridge has no pairing token; do not expose its port.
 - Validation results: see the latest project entry in `CHANGELOG.md`.
 
-Read [RULES.md](RULES.md) for event guidance, [AGENTS.md](AGENTS.md) for repository workflow, [AI_USAGE.md](AI_USAGE.md) for the actual AI assistance record, and [SUBMISSION.md](SUBMISSION.md) for submission details.
+See [MEETING_AUDIT.md](MEETING_AUDIT.md) for the detailed limitations and live-call checklist. Read [RULES.md](RULES.md) for event guidance, [AGENTS.md](AGENTS.md) for repository workflow, [AI_USAGE.md](AI_USAGE.md) for the actual AI assistance record, and [SUBMISSION.md](SUBMISSION.md) for submission details.

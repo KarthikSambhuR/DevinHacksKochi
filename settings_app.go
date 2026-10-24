@@ -142,7 +142,6 @@ func (s *SettingsApp) GetUpdateStatus() UpdateState {
 	return readUpdateState()
 }
 
-
 func (s *SettingsApp) GetAnalytics() []Analytics {
 	an, _ := GetAnalytics()
 	return an
@@ -893,7 +892,7 @@ func (s *SettingsApp) DownloadModel(id string) {
 				downloadLock.Lock()
 				downloadProgress[id] = percent
 				downloadLock.Unlock()
-				
+
 				speedStr := formatBytes(speed) + "/s"
 				etaStr := formatDuration(eta)
 				wailsRuntime.EventsEmit(s.ctx, "model-download-progress", id, percent, speedStr, etaStr)
@@ -1310,7 +1309,6 @@ func (s *SettingsApp) GetTransliterations() ([]WordMapping, error) {
 	return GetTransliterations()
 }
 
-
 func unzip(src string, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
@@ -1390,7 +1388,7 @@ func (s *SettingsApp) RegenerateMeetingSummary(id string) (string, error) {
 		return "", err
 	}
 	if detail.Meeting.FullTranscript == "" {
-		return "No dialogue transcript found for this meeting.", nil
+		return "", fmt.Errorf("no dialogue transcript found for this meeting")
 	}
 
 	engine := GetMeetingEngine()
@@ -1399,7 +1397,7 @@ func (s *SettingsApp) RegenerateMeetingSummary(id string) (string, error) {
 	}
 
 	go func() {
-		summary, shortSummary, err := generateMeetingSummary(detail.Meeting.FullTranscript)
+		summary, shortSummary, err := generateMeetingSummary(id, detail.Meeting.FullTranscript)
 		if err != nil {
 			summary = fmt.Sprintf("Summary generation encountered an error: %v\n\nFull dialogue is saved in transcript.", err)
 			shortSummary = ""
@@ -1593,3 +1591,9 @@ func (s *SettingsApp) IsExtensionConnected() bool {
 	return globalExtensionServer.activeClient != nil
 }
 
+// GetExtensionParticipants allows newly opened settings windows to recover the roster.
+func (s *SettingsApp) GetExtensionParticipants() []string {
+	globalExtensionServer.mutex.Lock()
+	defer globalExtensionServer.mutex.Unlock()
+	return append([]string{}, globalExtensionServer.knownParticipants...)
+}

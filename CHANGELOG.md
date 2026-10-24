@@ -1,5 +1,12 @@
 # Change log
 
+## 2026-10-25T00:14:40+05:30 — Harden meeting transcription and browser companion
+
+- Changed: imported the current LocalFlow meeting and extension updates, including participant roster replay, socket/tab lifecycle handling, speaker-attribution safeguards, meeting-specific model routing, stop/finalization fixes, and regression coverage. See `MEETING_AUDIT.md` for details and remaining risks.
+- Why: address lost participant state, stale meeting data, incomplete transcription tails, and summary/model routing errors.
+- Validation: `go test ./...` passed; `node --test extension/bridge.test.cjs` passed 7/7; `npm run build` passed with Vite warnings about Wails runtime scripts and an unresolved Urbanist font. `npm ci` reported 5 dependency audit findings (1 moderate, 4 high). Live browser-call validation remains pending.
+- Limitations: platform DOM selectors and speaker attribution remain unverified in live calls; the local WebSocket bridge has no pairing token. Human review is pending.
+
 ## 2026-10-25T00:10:21+05:30 — Bring LocalFlow into the Devin Hack Kochi repository
 
 - Changed: merged the existing template repository history with LocalFlow's original Git history; adapted this README and combined template and project ignore rules.
