@@ -53,6 +53,7 @@ cd frontend
 npm ci
 npm run build
 cd ..
+$env:PATH = "$PWD\lib\dll;$env:PATH"
 go test ./...
 node --test extension/bridge.test.cjs
 ```

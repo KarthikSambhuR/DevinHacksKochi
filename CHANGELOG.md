@@ -1,5 +1,12 @@
 # Change log
 
+## 2026-10-25T00:18:27+05:30 — Clarify native DLL test setup
+
+- Changed: documented the native DLL PATH setup required for Go tests on Windows.
+- Why: make the README's validation command match the successful local test run.
+- Validation: matched the documented command to the passing Go test run.
+- Limitations: the app's live meeting-platform behavior still needs manual validation.
+
 ## 2026-10-25T00:17:26+05:30 — Record the pushed implementation revision
 
 - Changed: recorded the current pushed implementation SHA in `SUBMISSION.md`.
